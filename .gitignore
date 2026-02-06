@@ -213,3 +213,5 @@ data/sample_images/*.png
 data/sample_images/*.jpg
 *.pth
 *.pt
+
+/results*

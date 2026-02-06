@@ -1,74 +1,16 @@
-"""
-Configuration file for stippling network
-"""
-
-import os
-
-
 class Config:
-    """Base configuration"""
+    # Model Architecture
+    NUM_POINTS = 1024  # Matched to 32x32 grid size
+    GRID_SIZE = 32     # The paper's specified grid dimension
     
-    # Model architecture
-    MODEL_INPUT_CHANNELS = 3
-    MODEL_BASE_CHANNELS = 64
+    # VGG Input
+    IMAGE_SIZE = 224   # Standard for VGG
     
     # Training
-    BATCH_SIZE = 4
-    NUM_EPOCHS = 100
+    BATCH_SIZE = 16
     LEARNING_RATE = 1e-4
-    IMAGE_SIZE = 512
     
-    # Loss weights
-    RECONSTRUCTION_WEIGHT = 1.0
-    PERCEPTUAL_WEIGHT = 0.1
-    GRADIENT_WEIGHT = 0.5
-    
-    # Data
-    DATA_DIR = 'data/training_images'
-    CHECKPOINT_DIR = 'checkpoints'
-    OUTPUT_DIR = 'outputs'
-    
-    # Training options
-    NUM_WORKERS = 4
-    PIN_MEMORY = True
-    USE_AUGMENTATION = True
-    
-    # Optimizer
-    OPTIMIZER = 'adam'
-    WEIGHT_DECAY = 1e-5
-    
-    # Learning rate scheduler
-    LR_SCHEDULER = 'step'
-    LR_STEP_SIZE = 30
-    LR_GAMMA = 0.5
-    
-    # Checkpointing
-    SAVE_EVERY = 10  # Save checkpoint every N epochs
-    
-    # Inference
-    INFERENCE_SIZE = 512
-    INFERENCE_METHOD = 'adaptive'  # 'adaptive', 'threshold', or 'gaussian'
-    
-    # Rendering parameters
-    DOT_DENSITY_SCALE = 1.0
-    NUM_DOTS_THRESHOLD = 5000
-    DENSITY_THRESHOLD = 0.3
-    BACKGROUND_COLOR = 255
-    DOT_COLOR = 0
-    
-    @staticmethod
-    def create_directories():
-        """Create necessary directories"""
-        os.makedirs(Config.CHECKPOINT_DIR, exist_ok=True)
-        os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
-        os.makedirs(Config.DATA_DIR, exist_ok=True)
-
-
-class TrainingConfig(Config):
-    """Configuration for training"""
-    pass
-
-
-class InferenceConfig(Config):
-    """Configuration for inference"""
-    BATCH_SIZE = 1
+    # Loss Weights (Paper defaults)
+    WEIGHT_CHAMFER = 1.0
+    WEIGHT_SPECTRUM = 0.1
+    WEIGHT_COLOR = 1.0

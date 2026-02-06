@@ -1,9 +1,10 @@
 """
-Training script for the stippling network
+Training script for Deep Learning 2D Image Stippling (Li et al., 2021)
+Uses supervised learning with source/target pairs
+Architecture: ResNet50 + AdaIN Grid Decoder
 """
 
 import os
-import sys
 import argparse
 import torch
 import torch.optim as optim
@@ -13,212 +14,210 @@ from PIL import Image
 import numpy as np
 from tqdm import tqdm
 
-# Add current directory to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 from src.models.stippling_network import create_model
 from src.models.losses import StipplingLoss
+from src.utils.image_processing import denormalize_image
 
 
-class ImageDataset(Dataset):
+class StipplingDataset(Dataset):
     """
-    Dataset for training stippling network
-    Loads images and converts to grayscale targets
+    Dataset for supervised stippling training.
+    - Source: grayscale images (input to network)
+    - Target: binary images with black dots (ground truth point positions)
     """
-    
-    def __init__(self, image_dir, image_size=512, augment=True):
-        self.image_dir = image_dir
+    def __init__(self, data_dir, image_size=224, num_points=2048):
+        self.source_dir = os.path.join(data_dir, 'source')
+        self.target_dir = os.path.join(data_dir, 'target')
         self.image_size = image_size
-        self.augment = augment
+        self.num_points = num_points
         
-        # Get all image files
-        self.image_files = [f for f in os.listdir(image_dir) 
-                           if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
+        # Get all source images
+        self.image_files = [f for f in os.listdir(self.source_dir) 
+                           if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
         
-        # Transforms
+        # ImageNet preprocessing for ResNet50
         self.transform = transforms.Compose([
             transforms.Resize((image_size, image_size)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
-        
-        self.target_transform = transforms.Compose([
-            transforms.Resize((image_size, image_size)),
-            transforms.Grayscale(num_output_channels=1),
-            transforms.ToTensor(),
-        ])
-        
-        if augment:
-            self.augment_transform = transforms.Compose([
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomVerticalFlip(p=0.5),
-                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
-            ])
     
     def __len__(self):
         return len(self.image_files)
     
+    def extract_points_from_target(self, target_path, source_img):
+        """
+        Extract point coordinates from binary target image.
+        Returns [N, 5] tensor with (x, y, r, g, b) normalized to [0,1]
+        """
+        # Load target and find black pixels
+        target = Image.open(target_path).convert('L')
+        orig_size = target.size[0]  # Assuming square (512)
+        target_arr = np.array(target)
+        
+        # Find black pixels (stipple points)
+        black_pixels = np.where(target_arr < 10)
+        y_coords = black_pixels[0]
+        x_coords = black_pixels[1]
+        
+        # Normalize to [0, 1]
+        x_norm = x_coords / orig_size
+        y_norm = y_coords / orig_size
+        
+        # Sample or pad to exactly num_points
+        n_found = len(x_coords)
+        if n_found >= self.num_points:
+            indices = np.random.choice(n_found, self.num_points, replace=False)
+        else:
+            indices = np.random.choice(n_found, self.num_points, replace=True)
+        
+        x_norm = x_norm[indices]
+        y_norm = y_norm[indices]
+        
+        # Get colors from source image at these coordinates
+        source_arr = np.array(source_img.resize((orig_size, orig_size)))
+        
+        if source_arr.ndim == 2:
+            colors = source_arr[y_coords[indices], x_coords[indices]]
+            colors = np.stack([colors, colors, colors], axis=1) / 255.0
+        else:
+            colors = source_arr[y_coords[indices], x_coords[indices]] / 255.0
+        
+        # Stack into [N, 5]: (x, y, r, g, b)
+        points = np.zeros((self.num_points, 5), dtype=np.float32)
+        points[:, 0] = x_norm
+        points[:, 1] = y_norm
+        points[:, 2:] = colors
+        
+        return torch.from_numpy(points)
+    
     def __getitem__(self, idx):
-        # Load image
-        img_path = os.path.join(self.image_dir, self.image_files[idx])
-        image = Image.open(img_path).convert('RGB')
+        filename = self.image_files[idx]
+        source_path = os.path.join(self.source_dir, filename)
+        target_path = os.path.join(self.target_dir, filename)
         
-        # Apply augmentation
-        if self.augment:
-            image = self.augment_transform(image)
-        
-        # Create RGB tensor (not normalized) for perceptual loss
-        rgb_transform = transforms.Compose([
-            transforms.Resize((self.image_size, self.image_size)),
-            transforms.ToTensor(),
-        ])
-        targets_rgb = rgb_transform(image)
-        
-        # Transform for input and grayscale target
-        input_tensor = self.transform(image)
-        target_tensor = self.target_transform(image)
-        
-        return input_tensor, target_tensor, targets_rgb
+        try:
+            source_img = Image.open(source_path).convert('RGB')
+            gt_points = self.extract_points_from_target(target_path, source_img)
+            input_tensor = self.transform(source_img)
+            return input_tensor, gt_points
+            
+        except Exception as e:
+            print(f"Error loading {filename}: {e}")
+            return torch.zeros((3, self.image_size, self.image_size)), \
+                   torch.zeros((self.num_points, 5))
 
 
 def train_epoch(model, dataloader, criterion, optimizer, device):
-    """Train for one epoch"""
     model.train()
     total_loss = 0.0
-    loss_components = {'reconstruction': 0.0, 'perceptual': 0.0, 'total': 0.0}
     
-    progress_bar = tqdm(dataloader, desc='Training')
-    for batch_idx, (inputs, targets_gray, targets_rgb) in enumerate(progress_bar):
-        inputs = inputs.to(device)
-        targets_gray = targets_gray.to(device)
-        targets_rgb = targets_rgb.to(device)
+    pbar = tqdm(dataloader, desc="Training")
+    
+    for images, gt_points in pbar:
+        images = images.to(device)
+        gt_points = gt_points.to(device)
         
         # Forward pass
-        optimizer.zero_grad()
-        outputs = model(inputs)
+        pred_points = model(images)
+        
+        # Denormalize images for color loss
+        raw_images = denormalize_image(images)
         
         # Calculate loss
-        loss, losses = criterion(outputs, targets_gray, targets_rgb)
+        loss, components = criterion(pred_points, gt_points, raw_images)
         
         # Backward pass
+        optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         
-        # Accumulate losses
         total_loss += loss.item()
-        for key, value in losses.items():
-            if key in loss_components:
-                loss_components[key] += value
         
-        # Update progress bar
-        progress_bar.set_postfix({'loss': loss.item()})
-    
-    # Average losses
-    num_batches = len(dataloader)
-    total_loss /= num_batches
-    for key in loss_components:
-        loss_components[key] /= num_batches
-    
-    return total_loss, loss_components
-
-
-def validate(model, dataloader, criterion, device):
-    """Validate the model"""
-    model.eval()
-    total_loss = 0.0
-    
-    with torch.no_grad():
-        for inputs, targets_gray, targets_rgb in dataloader:
-            inputs = inputs.to(device)
-            targets_gray = targets_gray.to(device)
-            targets_rgb = targets_rgb.to(device)
-            
-            outputs = model(inputs)
-            loss, _ = criterion(outputs, targets_gray, targets_rgb)
-            
-            total_loss += loss.item()
+        pbar.set_postfix({
+            'Loss': f"{loss.item():.4f}",
+            'Chamfer': f"{components['chamfer']:.4f}",
+            'Spectrum': f"{components['spectrum']:.4f}",
+            'Color': f"{components['color']:.4f}"
+        })
     
     return total_loss / len(dataloader)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train stippling network')
-    parser.add_argument('--data', type=str, required=True, help='Path to training images directory')
-    parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
-    parser.add_argument('--batch-size', type=int, default=4, help='Batch size')
-    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--image-size', type=int, default=512, help='Image size')
-    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints', help='Directory to save checkpoints')
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data', type=str, required=True, 
+                        help='Path to data directory with source/ and target/ folders')
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--points', type=int, default=2048, help='Number of stipple dots')
+    parser.add_argument('--save_dir', type=str, default='checkpoints')
+    parser.add_argument('--subset', type=int, default=None, help='Use only N images for quick testing')
     args = parser.parse_args()
     
-    # Create checkpoint directory
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    os.makedirs(args.save_dir, exist_ok=True)
     
-    # Create dataset and dataloader
-    print(f"Loading dataset from {args.data}...")
-    dataset = ImageDataset(args.data, image_size=args.image_size)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    # Setup model (ResNet50 + AdaIN Grid Decoder)
+    print(f"Initializing Model with {args.points} points...")
+    model = create_model(num_points=args.points).to(device)
     
-    print(f"Found {len(dataset)} images")
+    # Get trainable parameters (decoder components, encoder is frozen)
+    trainable_params = []
+    for module in model.decoder:
+        trainable_params.extend(module.parameters())
+    # Also train fc_z and const_input
+    trainable_params.append(model.fc_z.weight)
+    trainable_params.append(model.fc_z.bias)
+    trainable_params.append(model.const_input)
     
-    # Create model
-    print("Creating model...")
-    model = create_model()
-    model = model.to(args.device)
+    optimizer = optim.Adam(trainable_params, lr=args.lr)
     
-    # Create loss and optimizer
-    criterion = StipplingLoss(perceptual_weight=0.1, use_perceptual=True)
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.5)
+    # Paper loss: L = Lc + 0.1 * Ls + Lcolor
+    criterion = StipplingLoss(
+        weight_chamfer=1.0,
+        weight_spectrum=0.1,
+        weight_color=1.0,
+        image_size=256  # For spectrum calculation
+    ).to(device)
     
-    start_epoch = 0
+    # Dataset
+    dataset = StipplingDataset(args.data, num_points=args.points)
     
-    # Resume from checkpoint if specified
-    if args.resume and os.path.exists(args.resume):
-        print(f"Resuming from checkpoint: {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=args.device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
+    if args.subset is not None and args.subset < len(dataset):
+        from torch.utils.data import Subset
+        indices = list(range(args.subset))
+        dataset = Subset(dataset, indices)
+        print(f"Using subset of {args.subset} images")
     
-    # Training loop
-    print(f"Starting training on {args.device}...")
-    for epoch in range(start_epoch, args.epochs):
-        print(f"\nEpoch {epoch + 1}/{args.epochs}")
-        
-        # Train
-        train_loss, loss_components = train_epoch(model, dataloader, criterion, optimizer, args.device)
-        
-        print(f"Train Loss: {train_loss:.4f}")
-        print(f"  Reconstruction: {loss_components['reconstruction']:.4f}")
-        if 'perceptual' in loss_components:
-            print(f"  Perceptual: {loss_components['perceptual']:.4f}")
-        
-        # Update learning rate
-        scheduler.step()
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=args.batch_size, 
+        shuffle=True, 
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    print(f"Dataset size: {len(dataset)} images")
+    print("Starting Training...")
+    
+    for epoch in range(args.epochs):
+        print(f"\nEpoch {epoch+1}/{args.epochs}")
+        avg_loss = train_epoch(model, dataloader, criterion, optimizer, device)
+        print(f"Epoch Loss: {avg_loss:.5f}")
         
         # Save checkpoint
-        if (epoch + 1) % 10 == 0:
-            checkpoint_path = os.path.join(args.checkpoint_dir, f'model_epoch_{epoch + 1}.pth')
+        if (epoch + 1) % 5 == 0:
+            checkpoint_path = f"{args.save_dir}/stipple_net_{epoch+1}.pth"
             torch.save({
-                'epoch': epoch,
+                'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'loss': train_loss,
+                'loss': avg_loss,
             }, checkpoint_path)
             print(f"Saved checkpoint: {checkpoint_path}")
-    
-    # Save final model
-    final_path = os.path.join(args.checkpoint_dir, 'model_final.pth')
-    torch.save({
-        'epoch': args.epochs - 1,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-    }, final_path)
-    print(f"\nTraining complete! Final model saved: {final_path}")
 
 
 if __name__ == '__main__':

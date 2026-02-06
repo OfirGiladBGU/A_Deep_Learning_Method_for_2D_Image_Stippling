@@ -1,211 +1,282 @@
 """
-Loss functions for training the stippling network
+Loss functions for Deep Learning 2D Image Stippling (Li et al., 2021)
+Paper losses:
+- Chamfer Loss (Lc): Geometry matching between predicted and GT point sets
+- Radial Spectrum Loss (Ls): Blue noise distribution quality
+- Total: L = Lc + w * Ls (w=0.1 in paper)
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.models as models
+import numpy as np
 
 
-class PerceptualLoss(nn.Module):
+class ChamferLoss(nn.Module):
     """
-    Perceptual loss using VGG features
-    Measures perceptual similarity between generated and target images
+    Chamfer Distance Loss for Point Sets.
+    Computes bidirectional nearest neighbor distances between two point clouds.
+    
+    For each point in pred, find nearest in GT (and vice versa).
+    L = mean(min_dist_pred_to_gt) + mean(min_dist_gt_to_pred)
     """
-    
-    def __init__(self, feature_layers=[3, 8, 15, 22]):
-        super(PerceptualLoss, self).__init__()
-        
-        # Load pretrained VGG16
-        try:
-            # Try new API first
-            from torchvision.models import VGG16_Weights
-            vgg = models.vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features
-        except (ImportError, AttributeError):
-            # Fall back to older API if VGG16_Weights not available
-            import warnings
-            warnings.warn("Using deprecated pretrained parameter. Consider updating torchvision.", DeprecationWarning)
-            vgg = models.vgg16(pretrained=True).features
-        
-        # Extract feature extraction layers
-        self.feature_extractors = nn.ModuleList()
-        prev_layer = 0
-        
-        for layer_idx in feature_layers:
-            self.feature_extractors.append(vgg[prev_layer:layer_idx+1])
-            prev_layer = layer_idx + 1
-        
-        # Freeze parameters
-        for param in self.parameters():
-            param.requires_grad = False
-        
-        self.feature_layers = feature_layers
-    
-    def forward(self, generated, target):
+    def __init__(self):
+        super(ChamferLoss, self).__init__()
+
+    def forward(self, pred_points, gt_points):
         """
-        Calculate perceptual loss
-        
         Args:
-            generated: Generated density map [B, 1, H, W]
-            target: Target image [B, 3, H, W]
+            pred_points: [B, N, 2] predicted coordinates
+            gt_points: [B, M, 2] ground truth coordinates
             
         Returns:
-            Perceptual loss value
+            Chamfer distance (scalar)
         """
-        # Convert grayscale to RGB by repeating channels
-        if generated.size(1) == 1:
-            generated = generated.repeat(1, 3, 1, 1)
+        # Expand for pairwise distance computation
+        # pred: [B, N, 1, 2], gt: [B, 1, M, 2]
+        x = pred_points.unsqueeze(2)
+        y = gt_points.unsqueeze(1)
         
-        loss = 0.0
-        x_gen = generated
-        x_tar = target
+        # Squared Euclidean distance: [B, N, M]
+        dist = torch.pow(x - y, 2).sum(dim=-1)
         
-        # Extract features from each layer
-        for extractor in self.feature_extractors:
-            x_gen = extractor(x_gen)
-            x_tar = extractor(x_tar)
+        # For each predicted point, find nearest GT point
+        min_dist_pred, _ = torch.min(dist, dim=2)  # [B, N]
+        
+        # For each GT point, find nearest predicted point
+        min_dist_gt, _ = torch.min(dist, dim=1)    # [B, M]
+        
+        # Chamfer distance = mean of both directions
+        chamfer = torch.mean(min_dist_pred) + torch.mean(min_dist_gt)
+        
+        return chamfer
+
+
+class RadialSpectrumLoss(nn.Module):
+    """
+    Radial Power Spectrum Loss for Blue Noise quality.
+    
+    Computes the 1D radial power spectrum of the point distribution
+    and compares it to an ideal Blue Noise spectrum.
+    
+    Ls = ||RS(X) - RS(Y)||_1
+    """
+    def __init__(self, image_size=256, num_bins=64):
+        super(RadialSpectrumLoss, self).__init__()
+        self.image_size = image_size
+        self.num_bins = num_bins
+        
+        # Pre-compute ideal Blue Noise radial spectrum
+        # Real Blue Noise has:
+        # - Low energy at low frequencies (no clustering)
+        # - Flat energy at medium/high frequencies
+        self.register_buffer('ideal_spectrum', self._create_ideal_spectrum())
+        
+        # Pre-compute radius indices for radial averaging
+        self._setup_radial_indices()
+    
+    def _create_ideal_spectrum(self):
+        """
+        Create ideal Blue Noise radial spectrum.
+        Characteristics: suppressed low frequencies, flat high frequencies.
+        """
+        spectrum = torch.ones(self.num_bins)
+        
+        # Suppress low frequencies (the hallmark of Blue Noise)
+        cutoff = self.num_bins // 4
+        for i in range(cutoff):
+            spectrum[i] = (i / cutoff) ** 2
+        
+        # Normalize
+        spectrum = spectrum / spectrum.sum()
+        return spectrum
+    
+    def _setup_radial_indices(self):
+        """Pre-compute radius indices for efficient radial averaging"""
+        H, W = self.image_size, self.image_size
+        cy, cx = H // 2, W // 2
+        
+        y, x = torch.meshgrid(torch.arange(H), torch.arange(W), indexing='ij')
+        r = torch.sqrt((x - cx).float() ** 2 + (y - cy).float() ** 2)
+        
+        # Scale to bin indices
+        max_r = np.sqrt(cx ** 2 + cy ** 2)
+        r_bins = (r / max_r * (self.num_bins - 1)).long().clamp(0, self.num_bins - 1)
+        
+        self.register_buffer('radius_bins', r_bins.flatten())
+    
+    def soft_rasterize(self, points):
+        """
+        Differentiable soft rasterization of points onto a grid.
+        Uses Gaussian splatting for smooth gradients.
+        
+        Args:
+            points: [B, N, 2] in range [0, 1]
             
-            # Calculate L2 loss between features
-            loss += F.mse_loss(x_gen, x_tar)
+        Returns:
+            density: [B, H, W] soft density map
+        """
+        B, N, _ = points.shape
+        H, W = self.image_size, self.image_size
+        device = points.device
         
-        return loss / len(self.feature_extractors)
+        # Create coordinate grids
+        x_grid = torch.linspace(0, 1, W, device=device).view(1, 1, 1, W)
+        y_grid = torch.linspace(0, 1, H, device=device).view(1, 1, H, 1)
+        
+        # Point coordinates
+        px = points[:, :, 0].view(B, N, 1, 1)
+        py = points[:, :, 1].view(B, N, 1, 1)
+        
+        # Gaussian splatting
+        sigma = 2.0 / W  # Spread based on image size
+        dist_sq = (x_grid - px) ** 2 + (y_grid - py) ** 2
+        gaussians = torch.exp(-dist_sq / (2 * sigma ** 2))
+        
+        # Sum contributions from all points
+        density = torch.sum(gaussians, dim=1)  # [B, H, W]
+        
+        return density
+    
+    def compute_radial_spectrum(self, points):
+        """
+        Compute the 1D radial power spectrum of a point set.
+        
+        Steps:
+        1. Soft rasterize points to density map
+        2. Apply FFT
+        3. Compute radial average of power spectrum
+        """
+        B = points.shape[0]
+        device = points.device
+        
+        # 1. Soft rasterize
+        density = self.soft_rasterize(points)
+        
+        # 2. FFT and power spectrum
+        fft = torch.fft.fft2(density)
+        fft_shifted = torch.fft.fftshift(fft)
+        power = torch.abs(fft_shifted) ** 2  # [B, H, W]
+        
+        # 3. Radial average
+        power_flat = power.view(B, -1)  # [B, H*W]
+        
+        # Accumulate power in radial bins
+        radial_spectrum = torch.zeros(B, self.num_bins, device=device)
+        bin_counts = torch.zeros(self.num_bins, device=device)
+        
+        # Efficient scatter_add for radial binning
+        for i in range(self.num_bins):
+            mask = (self.radius_bins == i)
+            radial_spectrum[:, i] = power_flat[:, mask].mean(dim=1)
+        
+        # Normalize spectrum
+        radial_spectrum = radial_spectrum / (radial_spectrum.sum(dim=1, keepdim=True) + 1e-8)
+        
+        return radial_spectrum
+    
+    def forward(self, pred_points, gt_points=None):
+        """
+        Compute radial spectrum loss.
+        
+        Args:
+            pred_points: [B, N, 2] predicted coordinates
+            gt_points: [B, M, 2] optional GT points (if None, compare to ideal)
+            
+        Returns:
+            L1 loss between radial spectra
+        """
+        pred_spectrum = self.compute_radial_spectrum(pred_points[:, :, :2])
+        
+        if gt_points is not None:
+            target_spectrum = self.compute_radial_spectrum(gt_points[:, :, :2])
+        else:
+            target_spectrum = self.ideal_spectrum.unsqueeze(0).expand(pred_spectrum.shape[0], -1)
+        
+        return F.l1_loss(pred_spectrum, target_spectrum)
+
+
+class ColorLoss(nn.Module):
+    """
+    Color matching loss.
+    Compares predicted point colors to the actual image colors at those locations.
+    """
+    def __init__(self):
+        super(ColorLoss, self).__init__()
+        self.mse = nn.MSELoss()
+    
+    def forward(self, pred_points, input_image):
+        """
+        Args:
+            pred_points: [B, N, 5] with (x, y, r, g, b)
+            input_image: [B, 3, H, W] input image (0-1 range)
+            
+        Returns:
+            MSE loss between predicted and sampled colors
+        """
+        coords = pred_points[:, :, :2]  # [B, N, 2]
+        pred_colors = pred_points[:, :, 2:]  # [B, N, 3]
+        
+        # Convert coords to grid_sample format (-1 to 1)
+        grid_coords = coords.view(coords.shape[0], coords.shape[1], 1, 2) * 2 - 1
+        
+        # Sample image colors at point locations
+        sampled = F.grid_sample(input_image, grid_coords, align_corners=True, mode='bilinear')
+        sampled_colors = sampled.view(coords.shape[0], 3, -1).permute(0, 2, 1)  # [B, N, 3]
+        
+        return self.mse(pred_colors, sampled_colors)
 
 
 class StipplingLoss(nn.Module):
     """
-    Combined loss for stippling network training
-    Combines reconstruction loss with perceptual loss
-    """
+    Combined loss for supervised stippling training.
     
-    def __init__(self, perceptual_weight=0.1, use_perceptual=True):
+    L_total = w_chamfer * L_chamfer + w_spectrum * L_spectrum + w_color * L_color
+    
+    Paper defaults:
+    - w = 0.1 for spectrum loss relative to chamfer
+    """
+    def __init__(self, weight_chamfer=1.0, weight_spectrum=0.1, weight_color=1.0,
+                 image_size=256, grid_size=64):
         super(StipplingLoss, self).__init__()
         
-        self.use_perceptual = use_perceptual
-        self.perceptual_weight = perceptual_weight
+        self.weight_chamfer = weight_chamfer
+        self.weight_spectrum = weight_spectrum
+        self.weight_color = weight_color
         
-        # Reconstruction loss (L1 is better for preserving details)
-        self.l1_loss = nn.L1Loss()
-        
-        # Perceptual loss
-        if self.use_perceptual:
-            self.perceptual_loss = PerceptualLoss()
+        self.chamfer_loss = ChamferLoss()
+        self.spectrum_loss = RadialSpectrumLoss(image_size=image_size)
+        self.color_loss = ColorLoss()
     
-    def forward(self, generated, target_gray, target_rgb=None):
+    def forward(self, pred_points, gt_points, input_image):
         """
-        Calculate combined loss
-        
         Args:
-            generated: Generated density map [B, 1, H, W]
-            target_gray: Target grayscale image [B, 1, H, W]
-            target_rgb: Optional target RGB image for perceptual loss [B, 3, H, W]
+            pred_points: [B, N, 5] predicted (x, y, r, g, b)
+            gt_points: [B, M, 5] ground truth (x, y, r, g, b)
+            input_image: [B, 3, H, W] raw input image (0-1 range)
             
         Returns:
-            Total loss, dict of individual losses
+            total_loss, dict of component losses
         """
-        # Reconstruction loss (L1)
-        recon_loss = self.l1_loss(generated, target_gray)
+        # 1. Chamfer loss on coordinates
+        loss_chamfer = self.chamfer_loss(pred_points[:, :, :2], gt_points[:, :, :2])
         
-        total_loss = recon_loss
-        losses = {'reconstruction': recon_loss.item()}
+        # 2. Radial spectrum loss (compare to GT spectrum)
+        loss_spectrum = self.spectrum_loss(pred_points[:, :, :2], gt_points[:, :, :2])
         
-        # Perceptual loss
-        if self.use_perceptual and target_rgb is not None:
-            perc_loss = self.perceptual_loss(generated, target_rgb)
-            total_loss += self.perceptual_weight * perc_loss
-            losses['perceptual'] = perc_loss.item()
-        
-        losses['total'] = total_loss.item()
-        
-        return total_loss, losses
-
-
-class GradientLoss(nn.Module):
-    """
-    Gradient loss to preserve edges and details
-    """
-    
-    def __init__(self):
-        super(GradientLoss, self).__init__()
-    
-    def forward(self, generated, target):
-        """
-        Calculate gradient loss
-        
-        Args:
-            generated: Generated density map [B, 1, H, W]
-            target: Target image [B, 1, H, W]
-            
-        Returns:
-            Gradient loss value
-        """
-        # Sobel filters for gradients
-        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
-                               dtype=generated.dtype, device=generated.device).view(1, 1, 3, 3)
-        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
-                               dtype=generated.dtype, device=generated.device).view(1, 1, 3, 3)
-        
-        # Calculate gradients for generated
-        gen_grad_x = F.conv2d(generated, sobel_x, padding=1)
-        gen_grad_y = F.conv2d(generated, sobel_y, padding=1)
-        gen_grad = torch.sqrt(gen_grad_x ** 2 + gen_grad_y ** 2 + 1e-6)
-        
-        # Calculate gradients for target
-        tar_grad_x = F.conv2d(target, sobel_x, padding=1)
-        tar_grad_y = F.conv2d(target, sobel_y, padding=1)
-        tar_grad = torch.sqrt(tar_grad_x ** 2 + tar_grad_y ** 2 + 1e-6)
-        
-        # L1 loss on gradients
-        return F.l1_loss(gen_grad, tar_grad)
-
-
-class CombinedStipplingLoss(nn.Module):
-    """
-    Advanced combined loss with reconstruction, perceptual, and gradient components
-    """
-    
-    def __init__(self, recon_weight=1.0, perceptual_weight=0.1, gradient_weight=0.5):
-        super(CombinedStipplingLoss, self).__init__()
-        
-        self.recon_weight = recon_weight
-        self.perceptual_weight = perceptual_weight
-        self.gradient_weight = gradient_weight
-        
-        self.l1_loss = nn.L1Loss()
-        self.perceptual_loss = PerceptualLoss()
-        self.gradient_loss = GradientLoss()
-    
-    def forward(self, generated, target_gray, target_rgb):
-        """
-        Calculate combined loss with all components
-        
-        Args:
-            generated: Generated density map [B, 1, H, W]
-            target_gray: Target grayscale image [B, 1, H, W]
-            target_rgb: Target RGB image [B, 3, H, W]
-            
-        Returns:
-            Total loss, dict of individual losses
-        """
-        # Reconstruction loss
-        recon_loss = self.l1_loss(generated, target_gray)
-        
-        # Perceptual loss
-        perc_loss = self.perceptual_loss(generated, target_rgb)
-        
-        # Gradient loss
-        grad_loss = self.gradient_loss(generated, target_gray)
+        # 3. Color loss
+        loss_color = self.color_loss(pred_points, input_image)
         
         # Combined loss
-        total_loss = (self.recon_weight * recon_loss + 
-                     self.perceptual_weight * perc_loss + 
-                     self.gradient_weight * grad_loss)
+        total_loss = (self.weight_chamfer * loss_chamfer +
+                      self.weight_spectrum * loss_spectrum +
+                      self.weight_color * loss_color)
         
-        losses = {
-            'reconstruction': recon_loss.item(),
-            'perceptual': perc_loss.item(),
-            'gradient': grad_loss.item(),
+        components = {
+            'chamfer': loss_chamfer.item(),
+            'spectrum': loss_spectrum.item(),
+            'color': loss_color.item(),
             'total': total_loss.item()
         }
         
-        return total_loss, losses
+        return total_loss, components

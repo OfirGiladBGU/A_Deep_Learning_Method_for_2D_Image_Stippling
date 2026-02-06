@@ -1,6 +1,5 @@
-"""Utility functions for image processing and stippling"""
+"""Utility functions for image processing"""
 
-from .image_processing import load_image, save_image, preprocess_image
-from .rendering import render_stipples, create_stipple_image
+from .image_processing import load_image, denormalize_image
 
-__all__ = ['load_image', 'save_image', 'preprocess_image', 'render_stipples', 'create_stipple_image']
+__all__ = ['load_image', 'denormalize_image']
