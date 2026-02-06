@@ -44,7 +44,7 @@ def extract_dots_from_density(density_map, num_dots=5000, threshold=0.3):
     dots = []
     for (y, x), density in zip(selected_coords, selected_densities):
         # Radius proportional to density (inverted - darker areas get bigger dots)
-        radius = max(1, int((1 - density) * 5) + 1)
+        radius = max(1, int((1 - density) * 5))
         dots.append((int(x), int(y), radius))
     
     return dots
@@ -80,7 +80,7 @@ def extract_dots_adaptive(density_map, dot_density_scale=1.0):
                 
                 # Dot size inversely proportional to local density
                 # (darker areas = higher density = smaller dots for better detail)
-                radius = max(1, int((1 - local_density) * 4) + 1)
+                radius = max(1, int((1 - local_density) * 4))
                 
                 dots.append((int(x), int(y), radius))
     

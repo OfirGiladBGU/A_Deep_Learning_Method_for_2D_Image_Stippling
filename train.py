@@ -67,11 +67,18 @@ class ImageDataset(Dataset):
         if self.augment:
             image = self.augment_transform(image)
         
-        # Transform
+        # Create RGB tensor (not normalized) for perceptual loss
+        rgb_transform = transforms.Compose([
+            transforms.Resize((self.image_size, self.image_size)),
+            transforms.ToTensor(),
+        ])
+        targets_rgb = rgb_transform(image)
+        
+        # Transform for input and grayscale target
         input_tensor = self.transform(image)
         target_tensor = self.target_transform(image)
         
-        return input_tensor, target_tensor, input_tensor
+        return input_tensor, target_tensor, targets_rgb
 
 
 def train_epoch(model, dataloader, criterion, optimizer, device):

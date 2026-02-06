@@ -23,7 +23,9 @@ class PerceptualLoss(nn.Module):
             from torchvision.models import VGG16_Weights
             vgg = models.vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features
         except (ImportError, AttributeError):
-            # Fall back to older API
+            # Fall back to older API if VGG16_Weights not available
+            import warnings
+            warnings.warn("Using deprecated pretrained parameter. Consider updating torchvision.", DeprecationWarning)
             vgg = models.vgg16(pretrained=True).features
         
         # Extract feature extraction layers
