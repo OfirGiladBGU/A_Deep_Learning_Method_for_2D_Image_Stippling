@@ -4,32 +4,41 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-Implementation of a deep learning method for converting images into stippled art - a technique that represents images using dots.
+Implementation of the paper "A Deep Learning Method for 2D Image Stippling" (Li et al., ICIG 2021).
 
 ## Overview
 
-This project implements a neural network that learns to create artistic stippled representations of images. Stippling is an artistic technique where images are represented using dots of varying sizes and densities to create tonal variations.
-
-The implementation uses a U-Net style architecture with attention mechanisms to generate density maps that are then rendered into stippled images.
-
-## Features
-
-- **Deep Neural Network**: U-Net architecture with encoder-decoder design
-- **Attention Mechanisms**: Focus on important image features
-- **Multiple Rendering Methods**: 
-  - Adaptive dot placement based on density
-  - Threshold-based dot extraction
-  - Gaussian-smoothed dots for artistic effect
-- **Flexible Training**: Configurable loss functions (reconstruction + perceptual)
-- **Easy Inference**: Simple command-line interface for generating stippled images
+This project implements a neural network that learns to create artistic stippled representations of images. The network directly predicts point coordinates (x, y) and colors (r, g, b) for each stipple dot, trained with supervised learning using source/target image pairs.
 
 ## Architecture
 
-The stippling network consists of:
-1. **Encoder**: Extracts features from input images (4 downsampling blocks)
-2. **Bottleneck**: Processes features with attention mechanism
-3. **Decoder**: Generates density map (4 upsampling blocks with skip connections)
-4. **Output**: Single-channel density map indicating dot placement probability
+The implementation follows the exact paper architecture:
+
+- **Encoder**: ResNet50 (pretrained, frozen) → FC layer to 1024-dim style vector
+- **Style MLP**: 3-layer MLP for style mapping
+- **Grid Decoder**: AdaIN-based upsampling from 4×4 → 32×32 spatial grid
+- **Generator Heads**: Conv2d heads for density, location (dx, dy), and color (r, g, b)
+- **Output**: 1024 points (32×32 grid, 1 point per cell) with coordinates and colors
+
+## Features
+
+- **Point-based Output**: Directly predicts (x, y, r, g, b) for each stipple point
+- **AdaIN Grid Decoder**: Adaptive Instance Normalization for style conditioning
+- **Supervised Training**: Uses source/target image pairs for training
+- **Multiple Loss Functions**: 
+  - Chamfer Distance (point matching)
+  - Spectrum Loss (blue noise quality)
+  - Color Loss (point color matching)
+- **Easy Visualization**: Generate side-by-side comparisons with ground truth
+
+## Data Path
+
+Training data is located at:
+```
+/groups/asharf_group/ofirgila/ControlNet/training/data_grads_v3_2048/
+├── source/   # Input grayscale images
+└── target/   # Binary stipple images (black dots on white)
+```
 
 ## Installation
 
@@ -65,66 +74,57 @@ This will create sample images and generate stippled versions using different re
 
 ### Training
 
-To train the model on your own dataset:
+To train the model:
 
 ```bash
-python train.py --data path/to/images --epochs 100 --batch-size 4 --lr 1e-4
+python train.py --data /path/to/data --epochs 15 --batch_size 16 --points 1024
 ```
 
 **Arguments:**
-- `--data`: Path to directory containing training images
-- `--epochs`: Number of training epochs (default: 100)
-- `--batch-size`: Batch size for training (default: 4)
+- `--data`: Path to data directory with `source/` and `target/` folders
+- `--epochs`: Number of training epochs (default: 50)
+- `--batch_size`: Batch size for training (default: 16)
 - `--lr`: Learning rate (default: 1e-4)
-- `--image-size`: Size to resize images (default: 512)
-- `--checkpoint-dir`: Directory to save model checkpoints (default: checkpoints)
-- `--device`: Device to use: 'cuda' or 'cpu' (default: auto-detect)
-- `--resume`: Path to checkpoint to resume training from
+- `--points`: Number of stipple points (default: 1024, matches 32x32 grid)
+- `--subset`: Use subset of data for quick testing (optional)
 
-**Example:**
+**Example (quick test):**
 ```bash
-python train.py --data ./data/training_images --epochs 50 --batch-size 8 --device cuda
+python train.py --data /groups/asharf_group/ofirgila/ControlNet/training/data_grads_v3_2048 --epochs 15 --batch_size 16 --points 1024 --subset 1000
 ```
 
-### Inference
-
-Generate stippled images from trained model:
-
+**Example (full training):**
 ```bash
-python inference.py --input path/to/image.jpg --output path/to/output.png --model path/to/checkpoint.pth
+python train.py --data /groups/asharf_group/ofirgila/ControlNet/training/data_grads_v3_2048 --epochs 50 --batch_size 16 --points 1024
 ```
 
-**Arguments:**
-- `--input` / `-i`: Input image path
-- `--output` / `-o`: Output image path
-- `--model` / `-m`: Path to trained model checkpoint (optional)
-- `--device` / `-d`: Device to use: 'cuda' or 'cpu'
-- `--method`: Rendering method: 'adaptive', 'threshold', or 'gaussian' (default: adaptive)
+### Visualization
 
-**Example:**
+Generate visualizations comparing predictions with ground truth:
+
 ```bash
-python inference.py -i photo.jpg -o stippled.png -m checkpoints/model_final.pth --method gaussian
+python visualize.py --checkpoint checkpoints/stipple_net_15.pth --data /groups/asharf_group/ofirgila/ControlNet/training/data_grads_v3_2048 --output results --num_samples 5 --points 1024
 ```
 
 ## Project Structure
 
 ```
-A-_Deep_Learning_Method_for_2D_Image_Stippling/
+A_Deep_Learning_Method_for_2D_Image_Stippling/
 ├── src/
 │   ├── models/
-│   │   ├── stippling_network.py  # Main network architecture
-│   │   └── losses.py             # Loss functions
+│   │   ├── stippling_network.py  # ResNet50 + AdaIN Grid Decoder
+│   │   └── losses.py             # Chamfer, Spectrum, Color losses
 │   └── utils/
 │       ├── image_processing.py   # Image I/O and preprocessing
 │       └── rendering.py          # Stipple rendering utilities
 ├── examples/
 │   └── demo.py                   # Example demonstration
-├── data/
-│   └── sample_images/            # Sample input images
-├── outputs/                      # Generated outputs
 ├── checkpoints/                  # Model checkpoints
+├── results/                      # Visualization outputs
 ├── train.py                      # Training script
-├── inference.py                  # Inference script
+├── visualize.py                  # Visualization script
+├── inference.py                  # Single image inference
+├── config.py                     # Configuration settings
 ├── requirements.txt              # Python dependencies
 └── README.md                     # This file
 ```
@@ -133,41 +133,86 @@ A-_Deep_Learning_Method_for_2D_Image_Stippling/
 
 ### Neural Network Architecture
 
-- **Encoder**: 4 blocks with [64, 128, 256, 512] channels
-- **Bottleneck**: 1024 channels with channel attention
-- **Decoder**: 4 blocks with skip connections from encoder
-- **Output**: Single-channel density map with sigmoid activation
+- **Encoder**: ResNet50 (pretrained, frozen) → 2048 features → FC → 1024-dim style vector
+- **Style MLP**: 3 fully-connected layers with ReLU, all 1024 dimensions
+- **Grid Decoder**: 4×4 → 8×8 → 16×16 → 32×32 using AdaIN upsampling blocks
+- **Generator Heads**:
+  - Density: Conv2d(32→64→1) with Sigmoid
+  - Location: Conv2d(32→64→2) with Sigmoid (dx, dy offsets)
+  - Color: Conv2d(32→64→3) with Sigmoid (r, g, b)
+- **Output**: [B, 1024, 5] tensor with (x, y, r, g, b) for each point
 
 ### Loss Functions
 
-The network is trained with a combined loss:
-1. **Reconstruction Loss (L1)**: Ensures density map matches target intensity
-2. **Perceptual Loss (VGG)**: Maintains perceptual similarity with input
-3. **Gradient Loss** (optional): Preserves edges and details
+The network is trained with a combined loss (from `src/models/losses.py`):
+1. **Chamfer Distance**: Measures point-to-point matching between predicted and target points
+2. **Spectrum Loss**: Encourages blue noise distribution (computed via FFT)
+3. **Color Loss**: L1 loss on point colors
 
-### Rendering Methods
+Default weights: Chamfer=1.0, Spectrum=0.1, Color=1.0
 
-1. **Adaptive**: Grid-based sampling with density-dependent dot placement
-2. **Threshold**: Extract dots above density threshold using NMS
-3. **Gaussian**: Smooth dots with Gaussian kernels for artistic effect
+### Point Generation
+
+1. Grid decoder produces 32×32 feature map
+2. Location head predicts local offset (0-1) within each cell
+3. Global coordinate = (cell_index + offset) / grid_size
+4. Each cell produces exactly 1 point (no Top-K selection needed)
+5. Total: 32×32 = 1024 points
 
 ## Model Performance
 
 The model learns to:
-- Preserve important image features and edges
-- Adapt dot density to local image intensity
-- Create visually pleasing stippled representations
-- Generalize across different image types
+- Predict 1024 stipple points per image
+- Match spatial distribution of ground truth points (Chamfer loss)
+- Maintain blue noise spectral properties (Spectrum loss)
+- Preserve local image colors at each point
 
-**Note**: Results improve significantly with training on a diverse dataset of images.
+**Training Results (15 epochs, 1000 images):**
+- Final Loss: ~0.03
+- Chamfer Loss: ~0.01
+- Spectrum Loss: ~0.005
+- Training speed: ~5.8 it/s on RTX 6000
 
-## Dataset Preparation
+## Dataset
 
-For training, prepare a directory of images:
-- Supported formats: PNG, JPG, JPEG, BMP
-- Recommended: 100+ diverse images
-- Images will be automatically resized to specified size
-- Data augmentation is applied during training
+### Training Data Location
+
+```
+/groups/asharf_group/ofirgila/ControlNet/training/data_grads_v3_2048/
+├── source/   # ~40,000 grayscale input images (512x512 PNG)
+└── target/   # Corresponding stipple images (black dots on white)
+```
+
+### Dataset Format
+
+For training, prepare a directory with:
+- `source/` folder: Input images (grayscale or RGB, PNG format)
+- `target/` folder: Binary stipple images (black dots < threshold 10 on white background)
+- Matching filenames between source and target
+- Images should be square (512x512 recommended)
+
+The target images contain black pixels representing stipple dot locations. The training script automatically:
+- Extracts point coordinates from black pixels
+- Samples exactly 1024 points (to match 32×32 grid)
+- Associates colors from source image at each point location
+
+## Configuration
+
+Settings in `config.py`:
+
+```python
+class Config:
+    NUM_POINTS = 1024      # Matches 32x32 grid exactly
+    GRID_SIZE = 32         # Spatial grid dimension
+    IMAGE_SIZE = 224       # ResNet input size
+    BATCH_SIZE = 16
+    LEARNING_RATE = 1e-4
+    
+    # Loss Weights
+    WEIGHT_CHAMFER = 1.0   # Point matching
+    WEIGHT_SPECTRUM = 0.1  # Blue noise quality
+    WEIGHT_COLOR = 1.0     # Color matching
+```
 
 ## Citation
 
