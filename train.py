@@ -3,6 +3,7 @@ Training script for the stippling network
 """
 
 import os
+import sys
 import argparse
 import torch
 import torch.optim as optim
@@ -11,6 +12,9 @@ from torchvision import transforms
 from PIL import Image
 import numpy as np
 from tqdm import tqdm
+
+# Add current directory to path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.models.stippling_network import create_model
 from src.models.losses import StipplingLoss

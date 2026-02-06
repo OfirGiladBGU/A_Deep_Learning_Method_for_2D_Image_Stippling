@@ -18,7 +18,13 @@ class PerceptualLoss(nn.Module):
         super(PerceptualLoss, self).__init__()
         
         # Load pretrained VGG16
-        vgg = models.vgg16(pretrained=True).features
+        try:
+            # Try new API first
+            from torchvision.models import VGG16_Weights
+            vgg = models.vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features
+        except (ImportError, AttributeError):
+            # Fall back to older API
+            vgg = models.vgg16(pretrained=True).features
         
         # Extract feature extraction layers
         self.feature_extractors = nn.ModuleList()

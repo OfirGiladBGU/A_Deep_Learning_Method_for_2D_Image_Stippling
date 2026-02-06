@@ -3,9 +3,13 @@ Inference script for generating stippled images
 """
 
 import os
+import sys
 import argparse
 import torch
 from PIL import Image
+
+# Add current directory to path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.models.stippling_network import create_model
 from src.utils.image_processing import preprocess_image, save_image
