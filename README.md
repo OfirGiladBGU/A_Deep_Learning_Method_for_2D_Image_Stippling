@@ -12,17 +12,17 @@ This project implements a neural network that learns to create artistic stippled
 
 ## Architecture
 
-The implementation follows the exact paper architecture:
+The implementation follows the paper architecture:
 
 - **Encoder**: ResNet50 (pretrained, frozen) → FC layer to 1024-dim style vector
 - **Style MLP**: 3-layer MLP for style mapping
-- **Grid Decoder**: AdaIN-based upsampling from 4×4 → 32×32 spatial grid
-- **Generator Heads**: Conv2d heads for density, location (dx, dy), and color (r, g, b)
-- **Output**: 1024 points (32×32 grid, 1 point per cell) with coordinates and colors
+- **Grid Decoder**: AdaIN 3D decoder from 2×2×2 → 32×32×32 grid
+- **Generator MLPs**: 1x1x1 Conv3D stacks for density and location/color
+- **Output**: 2500 points selected from the grid with coordinates and colors
 
 ## Features
 
-- **Point-based Output**: Directly predicts (x, y, r, g, b) for each stipple point
+- **Point-based Output**: Predicts (x, y, r, g, b) for each stipple point
 - **AdaIN Grid Decoder**: Adaptive Instance Normalization for style conditioning
 - **Supervised Training**: Uses source/target image pairs for training
 - **Multiple Loss Functions**: 
@@ -60,6 +60,13 @@ cd A-_Deep_Learning_Method_for_2D_Image_Stippling
 pip install -r requirements.txt
 ```
 
+Or create the conda environment:
+
+```bash
+conda env create -f environment.yml
+conda activate stippling
+```
+
 ## Usage
 
 ### Quick Demo
@@ -77,25 +84,25 @@ This will create sample images and generate stippled versions using different re
 To train the model:
 
 ```bash
-python train.py --data /path/to/data --epochs 15 --batch_size 16 --points 1024
+python train.py --data /path/to/data --epochs 15 --batch_size 8 --points 2500
 ```
 
 **Arguments:**
 - `--data`: Path to data directory with `source/` and `target/` folders
 - `--epochs`: Number of training epochs (default: 50)
-- `--batch_size`: Batch size for training (default: 16)
-- `--lr`: Learning rate (default: 1e-4)
-- `--points`: Number of stipple points (default: 1024, matches 32x32 grid)
+- `--batch_size`: Batch size for training (default: 8)
+- `--lr`: Learning rate (default: 5e-4)
+- `--points`: Number of stipple points (default: 2500)
 - `--subset`: Use subset of data for quick testing (optional)
 
 **Example (quick test):**
 ```bash
-python train.py --data /groups/asharf_group/ofirgila/ControlNet/training/data_grads_v3_2048 --epochs 15 --batch_size 16 --points 1024 --subset 1000
+python train.py --data /groups/asharf_group/ofirgila/ControlNet/training/data_grads_v3_2048 --epochs 15 --batch_size 8 --points 2500 --subset 1000
 ```
 
 **Example (full training):**
 ```bash
-python train.py --data /groups/asharf_group/ofirgila/ControlNet/training/data_grads_v3_2048 --epochs 50 --batch_size 16 --points 1024
+python train.py --data /groups/asharf_group/ofirgila/ControlNet/training/data_grads_v3_2048 --epochs 50 --batch_size 8 --points 2500
 ```
 
 ### Visualization
@@ -103,7 +110,7 @@ python train.py --data /groups/asharf_group/ofirgila/ControlNet/training/data_gr
 Generate visualizations comparing predictions with ground truth:
 
 ```bash
-python visualize.py --checkpoint checkpoints/stipple_net_15.pth --data /groups/asharf_group/ofirgila/ControlNet/training/data_grads_v3_2048 --output results --num_samples 5 --points 1024
+python visualize.py --checkpoint checkpoints/stipple_net_15.pth --data /groups/asharf_group/ofirgila/ControlNet/training/data_grads_v3_2048 --output results --num_samples 5 --points 2500
 ```
 
 ## Project Structure
@@ -126,6 +133,7 @@ A_Deep_Learning_Method_for_2D_Image_Stippling/
 ├── inference.py                  # Single image inference
 ├── config.py                     # Configuration settings
 ├── requirements.txt              # Python dependencies
+├── environment.yml               # Conda environment
 └── README.md                     # This file
 ```
 
@@ -135,12 +143,11 @@ A_Deep_Learning_Method_for_2D_Image_Stippling/
 
 - **Encoder**: ResNet50 (pretrained, frozen) → 2048 features → FC → 1024-dim style vector
 - **Style MLP**: 3 fully-connected layers with ReLU, all 1024 dimensions
-- **Grid Decoder**: 4×4 → 8×8 → 16×16 → 32×32 using AdaIN upsampling blocks
-- **Generator Heads**:
-  - Density: Conv2d(32→64→1) with Sigmoid
-  - Location: Conv2d(32→64→2) with Sigmoid (dx, dy offsets)
-  - Color: Conv2d(32→64→3) with Sigmoid (r, g, b)
-- **Output**: [B, 1024, 5] tensor with (x, y, r, g, b) for each point
+- **Grid Decoder**: P(512×2×2×2) → C512 → U → C512 → C256 → U → C256 → C128 → U → C128 → C64 → U → C64 → C62
+- **Generator MLPs**:
+  - Density: FC16-FC8-FC4-FC1 (1x1x1 Conv3D)
+  - Location/Color: FC64-FC64-FC32-FC32-FC16-FC16-FC8-FC3 (1x1x1 Conv3D)
+- **Output**: [B, 2500, 5] tensor with (x, y, r, g, b) for each point
 
 ### Loss Functions
 
@@ -153,25 +160,19 @@ Default weights: Chamfer=1.0, Spectrum=0.1, Color=1.0
 
 ### Point Generation
 
-1. Grid decoder produces 32×32 feature map
+1. Grid decoder produces a 32×32×32 feature grid
 2. Location head predicts local offset (0-1) within each cell
 3. Global coordinate = (cell_index + offset) / grid_size
-4. Each cell produces exactly 1 point (no Top-K selection needed)
-5. Total: 32×32 = 1024 points
+4. Density head ranks cells and Top-K selects the final points
+5. Total: 2500 points per image
 
 ## Model Performance
 
 The model learns to:
-- Predict 1024 stipple points per image
+- Predict 2500 stipple points per image
 - Match spatial distribution of ground truth points (Chamfer loss)
 - Maintain blue noise spectral properties (Spectrum loss)
 - Preserve local image colors at each point
-
-**Training Results (15 epochs, 1000 images):**
-- Final Loss: ~0.03
-- Chamfer Loss: ~0.01
-- Spectrum Loss: ~0.005
-- Training speed: ~5.8 it/s on RTX 6000
 
 ## Dataset
 
@@ -193,7 +194,7 @@ For training, prepare a directory with:
 
 The target images contain black pixels representing stipple dot locations. The training script automatically:
 - Extracts point coordinates from black pixels
-- Samples exactly 1024 points (to match 32×32 grid)
+- Samples exactly 2500 points
 - Associates colors from source image at each point location
 
 ## Configuration

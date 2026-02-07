@@ -10,11 +10,12 @@ import numpy as np
 from PIL import Image
 from torchvision import transforms
 
+from config import Config
 from src.models.stippling_network import create_model
 from src.utils.image_processing import denormalize_image
 
 
-def load_model(checkpoint_path, num_points=2048, device='cpu'):
+def load_model(checkpoint_path, num_points=Config.NUM_POINTS, device='cpu'):
     """Load trained model from checkpoint"""
     model = create_model(num_points=num_points)
     
@@ -35,11 +36,11 @@ def extract_gt_points(target_path):
     """Extract ground truth points from binary target image"""
     target = Image.open(target_path).convert('L')
     target_arr = np.array(target)
-    orig_size = target.size[0]
+    width, height = target.size
     
     black_pixels = np.where(target_arr < 10)
-    y_coords = black_pixels[0] / orig_size
-    x_coords = black_pixels[1] / orig_size
+    y_coords = black_pixels[0] / max(height, 1)
+    x_coords = black_pixels[1] / max(width, 1)
     
     return x_coords, y_coords
 
@@ -56,7 +57,7 @@ def visualize_samples(model, data_dir, output_dir, num_samples=5, device='cpu'):
     
     # VGG preprocessing
     transform = transforms.Compose([
-        transforms.Resize((224, 224)),
+        transforms.Resize((Config.IMAGE_SIZE, Config.IMAGE_SIZE)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
@@ -93,9 +94,9 @@ def visualize_samples(model, data_dir, output_dir, num_samples=5, device='cpu'):
         
         # 2. Ground truth stipples
         axes[1].set_facecolor('white')
-        axes[1].scatter(gt_x * 224, (1 - gt_y) * 224, c='black', s=5)
-        axes[1].set_xlim(0, 224)
-        axes[1].set_ylim(0, 224)
+        axes[1].scatter(gt_x * Config.IMAGE_SIZE, (1 - gt_y) * Config.IMAGE_SIZE, c='black', s=5)
+        axes[1].set_xlim(0, Config.IMAGE_SIZE)
+        axes[1].set_ylim(0, Config.IMAGE_SIZE)
         axes[1].set_title(f'Ground Truth ({len(gt_x)} points)')
         axes[1].axis('off')
         axes[1].set_aspect('equal')
@@ -104,9 +105,17 @@ def visualize_samples(model, data_dir, output_dir, num_samples=5, device='cpu'):
         axes[2].set_facecolor('white')
         # Use grayscale for colors (average of RGB)
         gray_colors = pred_colors.mean(axis=1)
-        axes[2].scatter(pred_x * 224, (1 - pred_y) * 224, c=gray_colors, cmap='gray_r', s=5, vmin=0, vmax=1)
-        axes[2].set_xlim(0, 224)
-        axes[2].set_ylim(0, 224)
+        axes[2].scatter(
+            pred_x * Config.IMAGE_SIZE,
+            (1 - pred_y) * Config.IMAGE_SIZE,
+            c=gray_colors,
+            cmap='gray_r',
+            s=5,
+            vmin=0,
+            vmax=1,
+        )
+        axes[2].set_xlim(0, Config.IMAGE_SIZE)
+        axes[2].set_ylim(0, Config.IMAGE_SIZE)
         axes[2].set_title(f'Predicted ({len(pred_x)} points)')
         axes[2].axis('off')
         axes[2].set_aspect('equal')
@@ -133,7 +142,7 @@ def main():
                         help='Output directory for visualizations')
     parser.add_argument('--num_samples', type=int, default=5,
                         help='Number of samples to visualize')
-    parser.add_argument('--points', type=int, default=2048,
+    parser.add_argument('--points', type=int, default=Config.NUM_POINTS,
                         help='Number of stipple points')
     args = parser.parse_args()
     

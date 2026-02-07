@@ -1,14 +1,16 @@
 import torch
 import matplotlib.pyplot as plt
-from src.models.stippling_network import create_model
 from PIL import Image
 import torchvision.transforms as T
+
+from config import Config
+from src.models.stippling_network import create_model
 
 def generate_stipple(model, image_path, output_path, device='cpu'):
     # Preprocess
     img = Image.open(image_path).convert('RGB')
     transform = T.Compose([
-        T.Resize((224, 224)), # VGG Standard input
+        T.Resize((Config.IMAGE_SIZE, Config.IMAGE_SIZE)),
         T.ToTensor()
     ])
     input_tensor = transform(img).unsqueeze(0).to(device)
@@ -30,14 +32,14 @@ def generate_stipple(model, image_path, output_path, device='cpu'):
     
     # Note: Matplotlib coordinates have (0,0) at bottom-left, images at top-left
     # We invert Y to match image coordinates
-    plt.scatter(coords[:, 0] * 224, 
-                (1 - coords[:, 1]) * 224, 
+    plt.scatter(coords[:, 0] * Config.IMAGE_SIZE,
+                (1 - coords[:, 1]) * Config.IMAGE_SIZE,
                 c=colors, 
                 s=10) # s is dot size
     
     plt.axis('off')
-    plt.xlim(0, 224)
-    plt.ylim(0, 224)
+    plt.xlim(0, Config.IMAGE_SIZE)
+    plt.ylim(0, Config.IMAGE_SIZE)
     plt.savefig(output_path, bbox_inches='tight', pad_inches=0, dpi=300)
     plt.close()
     print(f"Saved to {output_path}")

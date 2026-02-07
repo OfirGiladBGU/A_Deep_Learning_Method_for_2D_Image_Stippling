@@ -1,8 +1,6 @@
 """
-Stippling Neural Network (Exact Paper Implementation)
-Paper: A Deep Learning Method for 2D Image Stippling (Li et al., 2021)
-Architecture: ResNet50 Encoder -> MLP Style Mapping -> AdaIN Grid Decoder (2D) -> Generator
-1 point per cell, 32x32 grid = 1024 points total
+Stippling Neural Network (Li et al., 2021)
+Architecture: ResNet50 Encoder -> Style MLP -> AdaIN 3D Grid Decoder -> Generator
 """
 
 import torch
@@ -12,145 +10,152 @@ from torchvision.models import resnet50, ResNet50_Weights
 
 
 class AdaIN(nn.Module):
-    """
-    Adaptive Instance Normalization (2D)
-    """
     def __init__(self, channels, style_dim):
-        super(AdaIN, self).__init__()
-        self.instance_norm = nn.InstanceNorm2d(channels)
+        super().__init__()
+        self.instance_norm = nn.InstanceNorm3d(channels)
         self.style_scale = nn.Linear(style_dim, channels)
         self.style_bias = nn.Linear(style_dim, channels)
 
     def forward(self, x, style):
-        gamma = self.style_scale(style).view(x.size(0), x.size(1), 1, 1)
-        beta = self.style_bias(style).view(x.size(0), x.size(1), 1, 1)
+        gamma = self.style_scale(style).view(x.size(0), x.size(1), 1, 1, 1) + 1.0
+        beta = self.style_bias(style).view(x.size(0), x.size(1), 1, 1, 1)
         return gamma * self.instance_norm(x) + beta
 
 
-class GridDecoderBlock(nn.Module):
-    """
-    Upsample -> Conv2D -> AdaIN -> ReLU
-    """
-    def __init__(self, in_channels, out_channels, style_dim):
-        super(GridDecoderBlock, self).__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+class GridConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, style_dim, dropout=0.2, is_last=False):
+        super().__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.dropout = nn.Dropout(dropout)
         self.adain = AdaIN(out_channels, style_dim)
-        self.relu = nn.ReLU(inplace=True)
+        self.is_last = is_last
 
     def forward(self, x, style):
-        x = F.interpolate(x, scale_factor=2, mode='nearest')
         x = self.conv(x)
-        x = self.relu(self.adain(x, style))
+        x = self.dropout(x)
+        x = self.adain(x, style)
+        if not self.is_last:
+            x = F.elu(x)
         return x
 
 
 class StipplingNetwork(nn.Module):
-    def __init__(self, num_points=1024, grid_size=32, style_dim=1024):
-        super(StipplingNetwork, self).__init__()
+    def __init__(self, num_points=2500, grid_size=32, style_dim=1024):
+        super().__init__()
         self.num_points = num_points
         self.grid_size = grid_size
-        
-        # --- ENCODER: ResNet50 ---
+
         resnet = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
         self.encoder = nn.Sequential(*list(resnet.children())[:-1])
         for param in self.encoder.parameters():
-            param.requires_grad = False  # Frozen as per paper implication
+            param.requires_grad = False
         self.fc_z = nn.Linear(2048, style_dim)
 
-        # --- STYLE MLP ---
         self.style_mlp = nn.Sequential(
             nn.Linear(style_dim, style_dim), nn.ReLU(),
             nn.Linear(style_dim, style_dim), nn.ReLU(),
             nn.Linear(style_dim, style_dim), nn.ReLU(),
         )
 
-        # --- GRID DECODER ---
-        # Starts at 4x4 spatial resolution
-        self.const_input = nn.Parameter(torch.randn(1, 256, 4, 4))
-        
-        self.block1 = GridDecoderBlock(256, 128, style_dim)  # 4 -> 8
-        self.block2 = GridDecoderBlock(128, 64, style_dim)   # 8 -> 16
-        self.block3 = GridDecoderBlock(64, 32, style_dim)    # 16 -> 32
+        self.P = nn.Parameter(torch.randn(1, 512, 2, 2, 2))
+        self.dropout_p = nn.Dropout(0.2)
+        self.adain_p = AdaIN(512, style_dim)
 
-        # --- GENERATOR HEADS ---
-        # No 3D tricks. Standard 2D convs on the 32x32 grid.
-        
-        # Density: predicts probability (paper mentions it, we output it but don't filter by it yet)
-        self.density_head = nn.Sequential(
-            nn.Conv2d(32, 64, kernel_size=1), nn.ReLU(),
-            nn.Conv2d(64, 1, kernel_size=1),
-            nn.Sigmoid()
-        )
-        
-        # Location: dx, dy (Strict Sigmoid 0-1 range)
-        self.location_head = nn.Sequential(
-            nn.Conv2d(32, 64, kernel_size=1), nn.ReLU(),
-            nn.Conv2d(64, 2, kernel_size=1),
-            nn.Sigmoid() 
-        )
-        
-        # Color: r, g, b
-        self.color_head = nn.Sequential(
-            nn.Conv2d(32, 64, kernel_size=1), nn.ReLU(),
-            nn.Conv2d(64, 3, kernel_size=1),
-            nn.Sigmoid()
-        )
+        self.layer_c512_a = GridConvBlock(512, 512, style_dim)
+        self.layer_c512_b = GridConvBlock(512, 512, style_dim)
+        self.layer_c256_a = GridConvBlock(512, 256, style_dim)
+        self.layer_c256_b = GridConvBlock(256, 256, style_dim)
+        self.layer_c128_a = GridConvBlock(256, 128, style_dim)
+        self.layer_c128_b = GridConvBlock(128, 128, style_dim)
+        self.layer_c64_a = GridConvBlock(128, 64, style_dim)
+        self.layer_c64_b = GridConvBlock(64, 64, style_dim)
+        self.layer_c62 = GridConvBlock(64, 62, style_dim, is_last=True)
 
-        self.decoder = nn.ModuleList([self.style_mlp, self.block1, self.block2, self.block3,
-                                      self.density_head, self.location_head, self.color_head])
+        self.density_mlp = nn.Sequential(
+            nn.Conv3d(62, 16, 1), nn.ELU(),
+            nn.Conv3d(16, 8, 1), nn.ELU(),
+            nn.Conv3d(8, 4, 1), nn.ELU(),
+            nn.Conv3d(4, 1, 1),
+        )
+        nn.init.constant_(self.density_mlp[-1].bias, 2.0)
+
+        self.location_mlp = nn.Sequential(
+            nn.Conv3d(62, 64, 1), nn.ELU(),
+            nn.Conv3d(64, 64, 1), nn.ELU(),
+            nn.Conv3d(64, 32, 1), nn.ELU(),
+            nn.Conv3d(32, 32, 1), nn.ELU(),
+            nn.Conv3d(32, 16, 1), nn.ELU(),
+            nn.Conv3d(16, 16, 1), nn.ELU(),
+            nn.Conv3d(16, 8, 1), nn.ELU(),
+            nn.Conv3d(8, 3, 1), nn.Sigmoid(),
+        )
 
     def forward(self, x):
         B = x.size(0)
-        
-        # Encode
         z = self.fc_z(self.encoder(x).flatten(1))
         w = self.style_mlp(z)
-        
-        # Decode
-        grid = self.const_input.repeat(B, 1, 1, 1)
-        grid = self.block1(grid, w)
-        grid = self.block2(grid, w)
-        grid = self.block3(grid, w)  # [B, 32, 32, 32]
-        
-        # Predict
-        density = self.density_head(grid)
-        offsets = self.location_head(grid)
-        colors = self.color_head(grid)
-        
-        return self.grid_to_points(offsets, colors)
 
-    def grid_to_points(self, offsets, colors):
-        """
-        Direct mapping: 1 cell = 1 point.
-        No Top-K. No Selection.
-        Total points = 32*32 = 1024.
-        """
-        B = offsets.shape[0]
-        device = offsets.device
-        H, W = 32, 32
-        
-        # Generate Grid Anchors
-        gy, gx = torch.meshgrid(torch.arange(H, device=device), 
-                                torch.arange(W, device=device), indexing='ij')
-        
-        gx = gx.float().view(1, 1, H, W)
-        gy = gy.float().view(1, 1, H, W)
-        
-        # Global Coordinates (Strict Sigmoid Logic)
-        # global = (anchor + offset) / size
-        global_x = (gx + offsets[:, 0:1, :, :]) / W
-        global_y = (gy + offsets[:, 1:2, :, :]) / H
-        
-        # Flatten
-        flat_x = global_x.view(B, -1)
-        flat_y = global_y.view(B, -1)
-        flat_r = colors[:, 0, :, :].view(B, -1)
-        flat_g = colors[:, 1, :, :].view(B, -1)
-        flat_b = colors[:, 2, :, :].view(B, -1)
-        
-        return torch.stack([flat_x, flat_y, flat_r, flat_g, flat_b], dim=2)
+        out = self.P.repeat(B, 1, 1, 1, 1)
+        out = self.dropout_p(out)
+        out = F.elu(self.adain_p(out, w))
+
+        out = self.layer_c512_a(out, w)
+
+        out = F.interpolate(out, scale_factor=2)
+        out = self.layer_c512_b(out, w)
+        out = self.layer_c256_a(out, w)
+
+        out = F.interpolate(out, scale_factor=2)
+        out = self.layer_c256_b(out, w)
+        out = self.layer_c128_a(out, w)
+
+        out = F.interpolate(out, scale_factor=2)
+        out = self.layer_c128_b(out, w)
+        out = self.layer_c64_a(out, w)
+
+        out = F.interpolate(out, scale_factor=2)
+        out = self.layer_c64_b(out, w)
+        grid_features = self.layer_c62(out, w)
+
+        density_logits = self.density_mlp(grid_features)
+        loc_color = self.location_mlp(grid_features)
+
+        return self.projection(density_logits, loc_color)
+
+    def projection(self, density_logits, loc_color):
+        B = density_logits.shape[0]
+        device = density_logits.device
+
+        flat_density = torch.sigmoid(density_logits).view(B, -1)
+        flat_loc = loc_color.view(B, 3, -1)
+
+        H = self.grid_size
+        W = self.grid_size
+        D = self.grid_size
+        gy, gx = torch.meshgrid(
+            torch.arange(H, device=device),
+            torch.arange(W, device=device),
+            indexing="ij",
+        )
+        gx = gx.unsqueeze(-1).expand(-1, -1, D).contiguous().view(1, 1, -1)
+        gy = gy.unsqueeze(-1).expand(-1, -1, D).contiguous().view(1, 1, -1)
+
+        global_x = (gx + flat_loc[:, 0:1, :]) / W
+        global_y = (gy + flat_loc[:, 1:2, :]) / H
+
+        _, indices = torch.topk(flat_density, self.num_points, dim=1)
+        batch_indices = torch.arange(B, device=device).unsqueeze(1).expand(-1, self.num_points)
+
+        final_x = global_x[batch_indices, 0, indices]
+        final_y = global_y[batch_indices, 0, indices]
+        final_c = flat_loc[batch_indices, 2, indices]
+
+        final_r = final_c
+        final_g = final_c
+        final_b = final_c
+
+        return torch.stack([final_x, final_y, final_r, final_g, final_b], dim=2)
 
 
-def create_model(num_points=1024, grid_size=32):
-    """Factory function to create the stippling network"""
+def create_model(num_points=2500, grid_size=32):
     return StipplingNetwork(num_points=num_points, grid_size=grid_size)

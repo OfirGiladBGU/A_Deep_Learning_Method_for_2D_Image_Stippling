@@ -14,6 +14,7 @@ from PIL import Image
 import numpy as np
 from tqdm import tqdm
 
+from config import Config
 from src.models.stippling_network import create_model
 from src.models.losses import StipplingLoss
 from src.utils.image_processing import denormalize_image
@@ -25,7 +26,7 @@ class StipplingDataset(Dataset):
     - Source: grayscale images (input to network)
     - Target: binary images with black dots (ground truth point positions)
     """
-    def __init__(self, data_dir, image_size=224, num_points=2048):
+    def __init__(self, data_dir, image_size=Config.IMAGE_SIZE, num_points=Config.NUM_POINTS):
         self.source_dir = os.path.join(data_dir, 'source')
         self.target_dir = os.path.join(data_dir, 'target')
         self.image_size = image_size
@@ -52,8 +53,8 @@ class StipplingDataset(Dataset):
         """
         # Load target and find black pixels
         target = Image.open(target_path).convert('L')
-        orig_size = target.size[0]  # Assuming square (512)
         target_arr = np.array(target)
+        width, height = target.size
         
         # Find black pixels (stipple points)
         black_pixels = np.where(target_arr < 10)
@@ -61,21 +62,22 @@ class StipplingDataset(Dataset):
         x_coords = black_pixels[1]
         
         # Normalize to [0, 1]
-        x_norm = x_coords / orig_size
-        y_norm = y_coords / orig_size
+        x_norm = x_coords / max(width, 1)
+        y_norm = y_coords / max(height, 1)
         
         # Sample or pad to exactly num_points
         n_found = len(x_coords)
-        if n_found >= self.num_points:
-            indices = np.random.choice(n_found, self.num_points, replace=False)
-        else:
-            indices = np.random.choice(n_found, self.num_points, replace=True)
+        if n_found == 0:
+            return torch.zeros((self.num_points, 5), dtype=torch.float32)
+
+        replace = n_found < self.num_points
+        indices = np.random.choice(n_found, self.num_points, replace=replace)
         
         x_norm = x_norm[indices]
         y_norm = y_norm[indices]
         
         # Get colors from source image at these coordinates
-        source_arr = np.array(source_img.resize((orig_size, orig_size)))
+        source_arr = np.array(source_img.resize((width, height)))
         
         if source_arr.ndim == 2:
             colors = source_arr[y_coords[indices], x_coords[indices]]
@@ -149,9 +151,10 @@ def main():
     parser.add_argument('--data', type=str, required=True, 
                         help='Path to data directory with source/ and target/ folders')
     parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--batch_size', type=int, default=16)
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--points', type=int, default=2048, help='Number of stipple dots')
+    parser.add_argument('--batch_size', type=int, default=Config.BATCH_SIZE)
+    parser.add_argument('--lr', type=float, default=Config.LEARNING_RATE)
+    parser.add_argument('--points', type=int, default=Config.NUM_POINTS, help='Number of stipple dots')
+    parser.add_argument('--image_size', type=int, default=Config.IMAGE_SIZE)
     parser.add_argument('--save_dir', type=str, default='checkpoints')
     parser.add_argument('--subset', type=int, default=None, help='Use only N images for quick testing')
     args = parser.parse_args()
@@ -162,29 +165,21 @@ def main():
     
     # Setup model (ResNet50 + AdaIN Grid Decoder)
     print(f"Initializing Model with {args.points} points...")
-    model = create_model(num_points=args.points).to(device)
-    
-    # Get trainable parameters (decoder components, encoder is frozen)
-    trainable_params = []
-    for module in model.decoder:
-        trainable_params.extend(module.parameters())
-    # Also train fc_z and const_input
-    trainable_params.append(model.fc_z.weight)
-    trainable_params.append(model.fc_z.bias)
-    trainable_params.append(model.const_input)
-    
-    optimizer = optim.Adam(trainable_params, lr=args.lr)
+    model = create_model(num_points=args.points, grid_size=Config.GRID_SIZE).to(device)
+
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optim.Adam(trainable_params, lr=args.lr, amsgrad=True)
     
     # Paper loss: L = Lc + 0.1 * Ls + Lcolor
     criterion = StipplingLoss(
         weight_chamfer=1.0,
         weight_spectrum=0.1,
         weight_color=1.0,
-        image_size=256  # For spectrum calculation
+        image_size=args.image_size
     ).to(device)
     
     # Dataset
-    dataset = StipplingDataset(args.data, num_points=args.points)
+    dataset = StipplingDataset(args.data, image_size=args.image_size, num_points=args.points)
     
     if args.subset is not None and args.subset < len(dataset):
         from torch.utils.data import Subset

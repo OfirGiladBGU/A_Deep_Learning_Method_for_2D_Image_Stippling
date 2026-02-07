@@ -7,14 +7,16 @@ import numpy as np
 from PIL import Image
 import torchvision.transforms as transforms
 
-def load_image(image_path, target_size=224):
+from config import Config
+
+def load_image(image_path, target_size=Config.IMAGE_SIZE):
     """
     Load and preprocess an image for VGG-19.
     Args:
         image_path: Path to the image file.
-        target_size: 224 is standard for VGG-19.
+        target_size: Network input size.
     Returns:
-        Tensor [1, 3, 224, 224] normalized for ImageNet.
+        Tensor [1, 3, H, W] normalized for ImageNet.
     """
     img = Image.open(image_path).convert('RGB')
     

@@ -1,14 +1,14 @@
 class Config:
     # Model Architecture
-    NUM_POINTS = 1024  # Matched to 32x32 grid size
-    GRID_SIZE = 32     # The paper's specified grid dimension
+    NUM_POINTS = 2500  # Paper setting
+    GRID_SIZE = 32     # Grid dimension
     
     # VGG Input
-    IMAGE_SIZE = 224   # Standard for VGG
+    IMAGE_SIZE = 256   # Paper setting
     
     # Training
-    BATCH_SIZE = 16
-    LEARNING_RATE = 1e-4
+    BATCH_SIZE = 8
+    LEARNING_RATE = 5e-4
     
     # Loss Weights (Paper defaults)
     WEIGHT_CHAMFER = 1.0
